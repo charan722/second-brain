@@ -1,5 +1,4 @@
-from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,11 +9,18 @@ from app.reflex import process_background_reflex
 
 app = FastAPI(title="Local Second Brain API")
 
+# Secure standard local CORS (disallows wildcards with credentials)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+        "http://127.0.0.1:5500",
+        "null"  # Supports opening frontend directly as a local file (file://)
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -22,7 +28,6 @@ app.add_middleware(
 def on_startup():
     init_db()
 
-# --- 1. NOTE MANAGEMENT ---
 class SaveNoteRequest(BaseModel):
     id: Optional[int] = None
     content: str
@@ -41,15 +46,27 @@ def list_notes_endpoint():
     conn.close()
     return [dict(n) for n in notes]
 
-# --- 2. TASKS & DEADLINES ---
+@app.delete("/api/notes/{note_id}")
+def delete_note_endpoint(note_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Purge vectors and chunks explicitly, then the note
+    cursor.execute("BEGIN TRANSACTION;")
+    cursor.execute("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE note_id = ?);", (note_id,))
+    cursor.execute("DELETE FROM chunks WHERE note_id = ?;", (note_id,))
+    cursor.execute("DELETE FROM notes WHERE id = ?;", (note_id,))
+    cursor.execute("COMMIT;")
+    conn.close()
+    return {"status": "deleted", "note_id": note_id}
+
 @app.get("/api/tasks")
 def list_tasks_endpoint():
     conn = get_connection()
-    tasks = conn.execute("SELECT id, title, due_date, status, created_at FROM tasks ORDER BY due_date ASC;").fetchall()
+    tasks = conn.execute("SELECT id, title, due_date, status, source_prompt, created_at FROM tasks ORDER BY due_date ASC;").fetchall()
     conn.close()
     return [dict(t) for t in tasks]
 
-# --- 3. CHAT & COGNITIVE ROUTER ---
 class ChatRequest(BaseModel):
     message: str
 
@@ -59,9 +76,5 @@ def chat_endpoint(req: ChatRequest, bg_tasks: BackgroundTasks):
     if not user_msg:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    # 1. Fire-and-forget: dispatch background reflex immediately
     bg_tasks.add_task(process_background_reflex, user_msg)
-
-    # 2. Synchronous intent routing and answer synthesis
-    result = route_and_respond(user_msg)
-    return result
+    return route_and_respond(user_msg)

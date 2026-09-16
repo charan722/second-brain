@@ -5,23 +5,34 @@ import sqlite_vec
 from ddgs import DDGS
 from app.database import get_connection
 from app.embedder import generate_embeddings
+from app.config import MODEL_NAME, OLLAMA_TIMEOUT, VECTOR_DISTANCE_THRESHOLD
 
-MODEL_NAME = "qwen2.5-coder:7b"
+SCHEDULE_REGEX = re.compile(
+    r"\b(when is|schedule|interview|meeting|deadline|due date|appointment|upcoming tasks|remind me)\b", 
+    re.IGNORECASE
+)
+WEB_REGEX = re.compile(
+    r"\b(search web|google|latest news|weather|today's news|look up on web)\b", 
+    re.IGNORECASE
+)
 
-# -------------------------------------------------------------------
-# 1. Cheap Pre-Retrieval Intent Classifier
-# -------------------------------------------------------------------
 def classify_intent(user_message: str) -> str:
+    # Heuristic fast-path: skips LLM call entirely
+    if SCHEDULE_REGEX.search(user_message):
+        return "SCHEDULE"
+    if WEB_REGEX.search(user_message):
+        return "WEB"
+
     prompt = f"""Classify this user message into exactly one category: SCHEDULE, CONCEPT, or WEB.
 SCHEDULE = asks about a specific date, deadline, scheduled event, interview, or appointment.
-CONCEPT = asks about an idea, technical topic, or something written in personal notes.
+CONCEPT = asks about an idea, technical topic, or personal notes content.
 WEB = requires current external facts, live news, or documentation not in personal notes.
 
 Message: "{user_message}"
 Respond with only the category word (SCHEDULE, CONCEPT, or WEB)."""
 
     try:
-        client = ollama.Client()
+        client = ollama.Client(timeout=OLLAMA_TIMEOUT)
         res = client.chat(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
@@ -33,16 +44,13 @@ Respond with only the category word (SCHEDULE, CONCEPT, or WEB)."""
                 return cat
         return "CONCEPT"
     except Exception as e:
-        print(f"Classifier error: {e}, falling back to CONCEPT")
+        print(f"Classifier error/timeout: {e}, falling back to CONCEPT")
         return "CONCEPT"
 
-# -------------------------------------------------------------------
-# 2. Branch Handlers
-# -------------------------------------------------------------------
-def retrieve_schedule(query: str) -> List[Dict[str, Any]]:
+def retrieve_schedule() -> List[Dict[str, Any]]:
     conn = get_connection()
     rows = conn.execute("""
-        SELECT id, title, due_date, status 
+        SELECT id, title, due_date, status, source_prompt
         FROM tasks 
         ORDER BY due_date ASC
         LIMIT 5;
@@ -50,10 +58,11 @@ def retrieve_schedule(query: str) -> List[Dict[str, Any]]:
     conn.close()
     return [dict(r) for r in rows]
 
-def retrieve_concepts(query: str, top_k: int = 3) -> List[str]:
+def retrieve_concepts(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
     conn = get_connection()
     query_vec = generate_embeddings([query])[0]
     
+    # Distance cutoff: Discards chunks that exceed VECTOR_DISTANCE_THRESHOLD
     matches = conn.execute("""
         SELECT c.chunk_text, v.distance
         FROM vec_chunks v
@@ -63,10 +72,13 @@ def retrieve_concepts(query: str, top_k: int = 3) -> List[str]:
     """, (sqlite_vec.serialize_float32(query_vec), top_k)).fetchall()
     
     conn.close()
-    return [m["chunk_text"] for m in matches]
+    return [
+        {"chunk_text": m["chunk_text"], "distance": round(m["distance"], 4)}
+        for m in matches
+        if m["distance"] <= VECTOR_DISTANCE_THRESHOLD
+    ]
 
 def clean_web_query(query: str) -> str:
-    """Strips meta commands like 'search web for' so search engines find real results."""
     cleaned = re.sub(r"(?i)^(search(\s+the)?\s+web\s+(for)?|google|look\s+up)\s*", "", query).strip()
     return cleaned if cleaned else query
 
@@ -81,15 +93,13 @@ def retrieve_web(query: str, max_results: int = 3) -> str:
     except Exception as e:
         return f"Web search unavailable: {e}"
 
-# -------------------------------------------------------------------
-# 3. Cognitive Dispatcher & Context Synthesizer
-# -------------------------------------------------------------------
 def route_and_respond(user_message: str) -> Dict[str, Any]:
     intent = classify_intent(user_message)
     context_str = ""
+    scores = []
 
     if intent == "SCHEDULE":
-        tasks = retrieve_schedule(user_message)
+        tasks = retrieve_schedule()
         if tasks:
             context_str = "Scheduled Tasks / Events in Database:\n" + "\n".join(
                 [f"- {t['title']} | Date: {t['due_date']} (Status: {t['status']})" for t in tasks]
@@ -100,17 +110,19 @@ def route_and_respond(user_message: str) -> Dict[str, Any]:
     elif intent == "CONCEPT":
         chunks = retrieve_concepts(user_message, top_k=3)
         if chunks:
-            context_str = "Relevant Personal Notes:\n" + "\n\n".join(chunks)
+            scores = [f"dist={c['distance']}" for c in chunks]
+            context_str = "Relevant Personal Notes:\n" + "\n\n".join(
+                [f"[{c['distance']}] {c['chunk_text']}" for c in chunks]
+            )
         else:
-            context_str = "No relevant personal notes found."
+            context_str = "No relevant personal notes found above similarity threshold."
 
     elif intent == "WEB":
-        web_data = retrieve_web(user_message)
-        context_str = f"Live Web Search Results:\n{web_data}"
+        context_str = f"Live Web Search Results:\n{retrieve_web(user_message)}"
 
     synthesis_prompt = f"""You are a personal second-brain assistant.
-Answer the user's question clearly using the provided grounded context.
-Summarize key points from the context if it contains relevant facts.
+Answer the user's message using ONLY the grounded context below.
+If no relevant notes or tasks are found in the context, explicitly inform the user.
 
 --- CONTEXT ({intent}) ---
 {context_str}
@@ -119,15 +131,20 @@ Summarize key points from the context if it contains relevant facts.
 User Message: {user_message}
 """
 
-    client = ollama.Client()
-    res = client.chat(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": synthesis_prompt}],
-        options={"temperature": 0.2}
-    )
+    try:
+        client = ollama.Client(timeout=OLLAMA_TIMEOUT)
+        res = client.chat(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": synthesis_prompt}],
+            options={"temperature": 0.2}
+        )
+        reply = res["message"]["content"]
+    except Exception as e:
+        reply = f"Local LLM service failed to respond within timeout ({OLLAMA_TIMEOUT}s): {e}"
 
     return {
-        "reply": res["message"]["content"],
+        "reply": reply,
         "intent": intent,
+        "distance_scores": scores,
         "raw_context": context_str
     }

@@ -1,11 +1,8 @@
 import sqlite3
-from pathlib import Path
 import sqlite_vec
-
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "notes_vault.db"
+from app.config import DB_PATH
 
 def get_connection() -> sqlite3.Connection:
-    """Creates a connection with sqlite-vec extension loaded."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.enable_load_extension(True)
@@ -15,11 +12,9 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 def init_db():
-    """Initializes the exact schema specified in the Second Brain pipeline."""
     conn = get_connection()
     cursor = conn.cursor()
     
-    # 1. Raw Notes Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,7 +24,6 @@ def init_db():
         );
     """)
     
-    # 2. Text Chunks Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,7 +33,6 @@ def init_db():
         );
     """)
     
-    # 3. Vector Embeddings Table (384 dimensions)
     cursor.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
             chunk_id INTEGER PRIMARY KEY,
@@ -47,7 +40,6 @@ def init_db():
         );
     """)
     
-    # 4. Structured Tasks Table (for Phase 3)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,10 +47,17 @@ def init_db():
             due_date TEXT,
             status TEXT DEFAULT 'confirmed',
             source_note_id INTEGER REFERENCES notes(id) ON DELETE SET NULL,
+            source_prompt TEXT,
             created_at TEXT NOT NULL
         );
     """)
     
+    # Safe migration if table already existed without source_prompt
+    cursor.execute("PRAGMA table_info(tasks);")
+    columns = [row["name"] for row in cursor.fetchall()]
+    if "source_prompt" not in columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN source_prompt TEXT;")
+        
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_note_id ON chunks(note_id);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_title ON tasks(title);")
@@ -68,4 +67,4 @@ def init_db():
 
 if __name__ == "__main__":
     init_db()
-    print("Database initialized successfully at:", DB_PATH)
+    print("Database initialized & migrated successfully.")
