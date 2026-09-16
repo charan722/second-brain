@@ -1,4 +1,79 @@
-<script>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Local Second Brain - Private PKM & AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-slate-100 h-screen flex flex-col font-sans overflow-hidden">
+
+  <!-- Top Bar & Deadlines Ticker -->
+  <header class="bg-white border-b px-6 py-2.5 flex items-center justify-between shadow-sm z-10">
+    <div class="flex items-center gap-3">
+      <span class="text-xl font-black tracking-tight text-slate-800">SecondBrain</span>
+      <span class="text-xs bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-semibold">100% Offline & Free</span>
+    </div>
+    <!-- Active Deadlines Drawer -->
+    <div id="deadlinesTicker" class="flex gap-2 overflow-x-auto max-w-2xl py-1 text-xs text-slate-600">
+      <span class="italic text-slate-400">Loading tasks...</span>
+    </div>
+  </header>
+
+  <!-- Main Workspace -->
+  <div class="flex-1 flex overflow-hidden">
+    
+    <!-- LEFT PANE: Note Taking Workspace -->
+    <section class="w-1/2 flex flex-col bg-white border-r border-slate-200">
+      <div class="p-4 border-b flex justify-between items-center bg-slate-50">
+        <div class="flex items-center gap-2">
+          <span class="font-bold text-slate-700 text-sm">Note Editor</span>
+          <span id="saveStatus" class="text-xs text-slate-400 font-mono"></span>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="newNote()" class="text-xs px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-100 font-medium text-slate-700 transition">New</button>
+          <button onclick="saveCurrentNote()" class="text-xs px-4 py-1.5 rounded bg-blue-600 hover:bg-blue-700 font-semibold text-white shadow-sm transition">Save & Embed</button>
+        </div>
+      </div>
+      <textarea id="noteArea" placeholder="Capture thoughts, code, or paste brain dumps here... Paragraphs are automatically embedded with FastEmbed ONNX." class="flex-1 p-6 resize-none outline-none font-mono text-sm leading-relaxed text-slate-800"></textarea>
+      
+      <!-- Notes History Strip -->
+      <div class="h-28 border-t bg-slate-50 p-2 overflow-x-auto flex gap-2" id="savedNotesList"></div>
+    </section>
+
+    <!-- RIGHT PANE: Grounded AI Assistant -->
+    <section class="w-1/2 flex flex-col bg-slate-50">
+      <div class="p-3.5 border-b bg-white flex justify-between items-center">
+        <span class="font-bold text-slate-700 text-sm">Cognitive Memory Assistant</span>
+        <span class="text-xs text-slate-400 font-mono">qwen2.5-coder:7b</span>
+      </div>
+
+      <!-- Chat History -->
+      <div id="chatHistory" class="flex-1 p-5 overflow-y-auto space-y-4 text-sm">
+        <div class="bg-white border border-slate-200 rounded-xl p-4 shadow-sm text-slate-600 max-w-lg">
+          <p class="font-semibold text-slate-800 mb-1">Try saying:</p>
+          <ul class="list-disc list-inside space-y-1 text-xs">
+            <li><i>"I have my TCS technical interview in 10 days"</i> <span class="text-emerald-600">(extracts task)</span></li>
+            <li><i>"When is my TCS interview?"</i> <span class="text-indigo-600">(queries exact SQL)</span></li>
+            <li><i>"What did I write about distributed systems?"</i> <span class="text-blue-600">(in-notes vector search)</span></li>
+            <li><i>"Search web for latest Python features"</i> <span class="text-amber-600">(zero-cost web search)</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Input Bar -->
+      <div class="p-4 bg-white border-t border-slate-200 flex gap-2">
+        <input id="chatInput" type="text" placeholder="Type a message, ask a question, or state an appointment..." class="flex-1 border border-slate-300 rounded-lg px-4 py-2.5 text-sm outline-none focus:border-blue-500 transition" onkeydown="if(event.key==='Enter') sendMessage()" />
+        <button onclick="sendMessage()" id="sendBtn" class="bg-slate-900 hover:bg-black text-white font-medium px-5 py-2.5 rounded-lg text-sm transition">Send</button>
+      </div>
+    </section>
+
+  </div>
+
+  <script>
     const API = "http://127.0.0.1:8000/api";
     let activeNoteId = null;
 
@@ -7,7 +82,7 @@
         const res = await fetch(`${API}/tasks`);
         const tasks = await res.json();
         const container = document.getElementById("deadlinesTicker");
-        if (tasks.length === 0) {
+        if (!tasks || tasks.length === 0) {
           container.innerHTML = `<span class="italic text-slate-400">No active deadlines</span>`;
           return;
         }
@@ -28,7 +103,7 @@
         const res = await fetch(`${API}/notes`);
         const notes = await res.json();
         const container = document.getElementById("savedNotesList");
-        if (notes.length === 0) {
+        if (!notes || notes.length === 0) {
           container.innerHTML = `<span class="text-xs text-slate-400 p-2">No notes yet. Create your first note above.</span>`;
           return;
         }
@@ -75,15 +150,19 @@
       if (!content) return;
       document.getElementById("saveStatus").innerText = "Embedding & Saving...";
       
-      const res = await fetch(`${API}/notes`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: activeNoteId, content })
-      });
-      const data = await res.json();
-      activeNoteId = data.note_id;
-      document.getElementById("saveStatus").innerText = `Saved & Indexed (#${data.note_id})`;
-      fetchNotes();
+      try {
+        const res = await fetch(`${API}/notes`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: activeNoteId, content })
+        });
+        const data = await res.json();
+        activeNoteId = data.note_id;
+        document.getElementById("saveStatus").innerText = `Saved & Indexed (#${data.note_id})`;
+        fetchNotes();
+      } catch (e) {
+        document.getElementById("saveStatus").innerText = "Save failed";
+      }
     }
 
     async function sendMessage() {
@@ -93,7 +172,6 @@
 
       const history = document.getElementById("chatHistory");
       
-      // User bubble
       history.innerHTML += `
         <div class="flex justify-end">
           <div class="bg-slate-900 text-white rounded-2xl rounded-tr-none px-4 py-2.5 max-w-md">${text}</div>
@@ -144,3 +222,5 @@
     fetchTasks();
     fetchNotes();
   </script>
+</body>
+</html>
